@@ -24,8 +24,8 @@ class Config:
     out_dir: str = 'out-shakespeare-char'
     eval_only: bool = False
     eval_interval: int = 250
-    log_interval: int = 1
     eval_iters: int = 200
+    log_interval: int = 10
     always_save_on_checkpoint: bool = True
 
 
@@ -67,7 +67,7 @@ class Config:
 
 
 
-config = Config(batch_size=32)
+config = Config()
 print(config)
 
 # %%
@@ -98,7 +98,7 @@ ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=
 # %%
 ##############################
 # so called "poor man's" dataloader
-data_dir = os.path.join('data', config.dataset)
+data_dir = os.path.join('../data', config.dataset)
 def get_batch(split):
     # We recreate np.memmap every batch to avoid a memory leak, as per
     # https://stackoverflow.com/questions/45132940/numpy-memmap-memory-usage-want-to-iterate-once/61472122#61472122
@@ -294,7 +294,7 @@ while True:
         if local_iter_num >= 5: # let the training loop settle a bit
             mfu = raw_model.estimate_mfu(config.batch_size * config.gradient_accumulation_steps, dt)
             running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
-        print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu} tflops")
+        print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu:.2f} tflops")
     iter_num += 1
     local_iter_num += 1
 

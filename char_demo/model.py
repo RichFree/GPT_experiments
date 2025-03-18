@@ -138,7 +138,7 @@ class GPT(nn.Module):
         self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
 
         # init all weights
-        self.apply(self._init_weights)
+        self.apply(self._init_weights) # is a nn.Module function
         # apply special scaled init to the residual projections, per GPT-2 paper
         for pn, p in self.named_parameters():
             if pn.endswith('c_proj.weight'):
