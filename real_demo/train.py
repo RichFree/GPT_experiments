@@ -11,6 +11,7 @@ import numpy as np
 import torch
 from torch.utils.tensorboard import SummaryWriter
 
+# from model_new import GPTConfig, GPT
 from model import GPTConfig, GPT
 
 # %%
