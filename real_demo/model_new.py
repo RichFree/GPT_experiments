@@ -32,13 +32,19 @@ class LayerNorm(nn.Module):
 class Rotary(nn.Module):
     def __init__(self, dim: int, max_seq_len: int):
         super().__init__()
-        # half-truncate RoPE by @YouJiacheng (w/ base freq tuning)
-        angular_freq = (1 / 1024) ** torch.linspace(0, 1, steps=dim//4, dtype=torch.float32)
-        angular_freq = torch.cat([angular_freq, angular_freq.new_zeros(dim//4)])
+        self.dim = dim
+        # previously would split into upper and lower, but now just use the whole
+        # MLA uses decoupled rope embeddings, hence we use the whole vector
+        angular_freq = (1 / 1024) ** torch.linspace(0, 1, steps=dim//2, dtype=torch.float32)
+        # head is split into upper and lower sections
+        # half-truncate RoPE by @YouJiacheng (w/ base freq tuning) dim//4
+        # but only half of the embedding is used for rotation
+        # angular_freq = [rope_section, untouched section]
+        # angular_freq = torch.cat([angular_freq, angular_freq.new_zeros(dim//4)])
         t = torch.arange(max_seq_len, dtype=torch.float32)
         theta = torch.einsum("i,j -> ij", t, angular_freq)
-        self.cos = nn.Buffer(theta.cos().contiguous(), persistent=False).to('cuda') # buffer stores intermediate calcs
-        self.sin = nn.Buffer(theta.sin().contiguous(), persistent=False).to('cuda')
+        self.cos = nn.Buffer(theta.cos().contiguous(), persistent=False) # buffer stores intermediate calcs
+        self.sin = nn.Buffer(theta.sin().contiguous(), persistent=False)
 
     def forward(self, x_BTHD: Tensor, start: int):
         assert self.cos.size(0) >= x_BTHD.size(1) # block size aka context length
@@ -63,7 +69,7 @@ class MultiHeadLatentAttention(nn.Module):
         self.d_head = config.n_embd // config.n_head
         self.d_c = config.d_c
         self.d_c1 = config.d_c1
-        self.d_rotate = config.d_rotate # keep is simple stupid first
+        self.d_rotate = config.d_rotate # keep it simple stupid first
         self.dropout = config.dropout
 
         # linear down-projection transforms
@@ -75,7 +81,7 @@ class MultiHeadLatentAttention(nn.Module):
         self.UK_proj = nn.Linear(self.d_c, self.d_model, bias=config.bias)
         self.UV_proj = nn.Linear(self.d_c, self.d_model, bias=config.bias)
 
-        # linear rope-prrojection
+        # linear rope-projection
         self.RQ_proj = nn.Linear(self.d_c1, self.n_head * self.d_rotate, bias=config.bias)
         self.RK_proj = nn.Linear(self.n_embd, self.d_rotate, bias=config.bias)
 
