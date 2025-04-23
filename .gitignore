@@ -1,2 +1,4 @@
 __pycache__
+device_check/
 .mypy_cache
+quantize_int8

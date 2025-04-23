@@ -10,11 +10,17 @@ https://github.com/huggingface/transformers/blob/main/src/transformers/models/gp
 import math
 import inspect
 from dataclasses import dataclass
-from typing import Tuple
 
 import torch
-from torch import Tensor, nn
+import torch.nn as nn
 from torch.nn import functional as F
+from torch import Tensor
+
+from linear_fp8 import CastedLinear
+
+def norm(x: Tensor):
+    return F.rms_norm(x, (x.size(-1),))
+
 
 class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
@@ -27,205 +33,18 @@ class LayerNorm(nn.Module):
     def forward(self, input):
         return F.layer_norm(input, self.weight.shape, self.weight, self.bias, 1e-5)
 
-
-# from KellerJordan/modded-nanogpt
-class Rotary(nn.Module):
-    def __init__(self, dim: int, max_seq_len: int):
-        super().__init__()
-        self.dim = dim
-        # previously would split into upper and lower, but now just use the whole
-        # MLA uses decoupled rope embeddings, hence we use the whole vector
-        angular_freq = (1 / 1024) ** torch.linspace(0, 1, steps=dim//2, dtype=torch.float32)
-        # head is split into upper and lower sections
-        # half-truncate RoPE by @YouJiacheng (w/ base freq tuning) dim//4
-        # but only half of the embedding is used for rotation
-        # angular_freq = [rope_section, untouched section]
-        # angular_freq = torch.cat([angular_freq, angular_freq.new_zeros(dim//4)])
-        t = torch.arange(max_seq_len, dtype=torch.float32)
-        theta = torch.einsum("i,j -> ij", t, angular_freq)
-        self.cos = nn.Buffer(theta.cos().contiguous(), persistent=False) # buffer stores intermediate calcs
-        self.sin = nn.Buffer(theta.sin().contiguous(), persistent=False)
-
-    def forward(self, x_BTHD: Tensor, start: int):
-        assert self.cos.size(0) >= x_BTHD.size(1) # block size aka context length
-        cos, sin = self.cos[None, start:x_BTHD.size(1), None, :], self.sin[None, start:x_BTHD.size(1), None, :]
-        x1, x2 = x_BTHD.to(dtype=torch.float32).chunk(2, dim=-1)
-        y1 = x1 * cos + x2 * sin
-        y2 = x1 * (-sin) + x2 * cos
-        return torch.cat((y1, y2), -1).type_as(x_BTHD)
-
-class MultiHeadLatentAttention(nn.Module):
-
-    def __init__(self, config):
-        super().__init__()
-        assert config.n_embd % config.n_head == 0 # n_embd must be divisible by num_head
-        assert config.d_c < config.n_embd
-        assert config.d_c1 < config.n_embd
-
-        # dimensions
-        self.d_model = config.n_embd
-        self.n_embd = config.n_embd
-        self.n_head = config.n_head # aka num_head
-        self.d_head = config.n_embd // config.n_head
-        self.d_c = config.d_c
-        self.d_c1 = config.d_c1
-        self.d_rotate = config.d_rotate # keep it simple stupid first
-        self.dropout = config.dropout
-
-        # linear down-projection transforms
-        self.DKV_proj = nn.Linear(self.n_embd, self.d_c, bias=config.bias)
-        self.DQ_proj = nn.Linear(self.n_embd, self.d_c1, bias=config.bias)
-
-        # linear up-projection transforms
-        self.UQ_proj = nn.Linear(self.d_c1, self.d_model, bias=config.bias)
-        self.UK_proj = nn.Linear(self.d_c, self.d_model, bias=config.bias)
-        self.UV_proj = nn.Linear(self.d_c, self.d_model, bias=config.bias)
-
-        # linear rope-projection
-        self.RQ_proj = nn.Linear(self.d_c1, self.n_head * self.d_rotate, bias=config.bias)
-        self.RK_proj = nn.Linear(self.n_embd, self.d_rotate, bias=config.bias)
-
-        # linear output transformations
-        self.output_proj = nn.Linear(self.d_model, self.d_model, bias=config.bias)
-
-        # rotary layer
-        self.rotary = Rotary(dim=config.d_rotate, max_seq_len=config.block_size)
-
-        self.scaler = float(1.0 / math.sqrt(self.d_head + self.d_rotate))
-
-        # for now focus on train only, no cache
-        # # C_KV and R_K cache
-        # # Initialize C_KV and R_K cache for inference
-        # self.cache_kv = torch.zeros(
-        #     (config.max_batch_size, config.max_seq_len, config.d_c)
-        # )
-        # self.cache_rk = torch.zeros(
-        #     (config.max_batch_size, config.max_seq_len, config.d_rotate)
-        # )
-        self.resid_dropout = nn.Dropout(config.dropout)
-
-
-        # flash attention make GPU go brrrrr but support is only in PyTorch >= 2.0
-        self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
-        if self.flash:
-            pass
-        else:
-            print("WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
-            # causal mask to ensure that attention is only applied to the left in the input sequence
-            self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
-                                        .view(1, 1, config.block_size, config.block_size))
-
-
-
-    def forward(
-        self,
-        x,
-        attn_mask=None,
-        use_cache=False,
-        start_pos: int = 0
-    ):
-        """
-        Forward pass supporting both standard attention and cached inference
-        Input shape: [batch_size, seq_len, d_model=num_head * d_head]
-        Args:
-            sequence: Input sequence [batch_size, seq_len, d_model]
-            key_value_states: Optional states for cross-attention
-            att_mask: Optional attention mask
-            use_cache: Whether to use KV caching (for inference)
-            start_pos: Position in sequence when using KV cache
-        """
-        batch_size, seq_len, model_dim = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
-        
-        # linear projections for things involving the query vector
-        C_Q = self.DQ_proj(x) # [batch_size, seq_len, d_c1]
-        Q_state = self.UQ_proj(C_Q) # [batch_size, seq_len, d_model]
-        # linear projection for query RoPE pathway
-        Q_rotate = self.RQ_proj(C_Q) # [batch_size, seq_len, num_head*d_rotate]
-
-        if use_cache:
-            pass
-        else:
-            # compression projection for C_KV
-            C_KV = self.DKV_proj(x)
-            # RoPE pathway for shared key
-            K_rotate = self.RK_proj(x)
-
-        # up-projection for key and value
-        K_state = self.UK_proj(C_KV) # [batch_size, kv_seq_len, d_model]
-        V_state = self.UV_proj(C_KV) # [batch_size, kv_seq_len, d_model]
-
-        Q_state = Q_state.view(batch_size, seq_len, self.n_head, self.d_head)
-
-        # After getting K_state from projection, get its actual sequence length
-        actual_kv_len = K_state.size(1)    # kv_seq_len or start_pos + kv_seq_len
-        # in cross-attention, key/value sequence length might be different from query sequence length
-        # Use actual_kv_len instead of kv_seq_len for reshaping
-        K_state = K_state.view(batch_size, actual_kv_len, self.n_head, self.d_head) 
-        V_state = V_state.view(batch_size, actual_kv_len, self.n_head, self.d_head)
-
-
-        #Apply RoPE to query and shared key
-        Q_rotate = Q_rotate.view(batch_size, seq_len, self.n_head, self.d_rotate)
-        K_rotate = K_rotate.unsqueeze(2).expand(-1, -1, self.n_head, -1)  # [batch, cached_len, num_head, d_rotate]
-        Q_rotate, K_rotate = self.rotary(Q_rotate, start_pos), self.rotary(K_rotate, start_pos)
-        # Q_rotate, K_rotate = apply_rotary_emb(Q_rotate, K_rotate, freqs_cis=freqs_cis)
-
-
-        # Concatenate along head dimension
-        # Q_state = torch.cat([Q_state, Q_rotate], dim=-1)  # [batch_size, seq_len, num_head, d_head + d_rotate]
-        # K_state = torch.cat([K_state, K_rotate], dim=-1)  # [batch_size, actual_kv_len, num_head, d_head + d_rotate]
-        Q_state[..., : self.d_rotate] += Q_rotate
-        K_state[..., : self.d_rotate] += K_rotate
-
-
-        # Scale Q by 1/sqrt(d_k)
-        Q_state = Q_state * self.scaler
-        Q_state = Q_state.transpose(1, 2).contiguous()  # [batch_size, num_head, seq_len, head_dim]
-        K_state = K_state.transpose(1, 2).contiguous()  # [batch_size, num_head, actual_kv_len, head_dim]
-        V_state = V_state.transpose(1, 2).contiguous()  # [batch_size, num_head, actual_kv_len, head_dim]
-
-        # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
-        if self.flash:
-            # efficient attention using Flash Attention CUDA kernels
-            y = torch.nn.functional.scaled_dot_product_attention(
-                Q_state, K_state, V_state, attn_mask=None,
-                dropout_p=self.dropout if self.training else 0, is_causal=True)
-        else:
-            assert(False) # just error out
-            # # manual implementation of attention
-            # att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-            # att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
-            # att = F.softmax(att, dim=-1)
-            # att = self.attn_dropout(att)
-            # y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
-        y = y.transpose(1, 2).contiguous().view(batch_size, seq_len, self.n_head*self.d_head) # re-assemble all head outputs side by side
-
-        # output projection
-        y = self.resid_dropout(self.output_proj(y))
-        assert y.size() == (batch_size, seq_len, self.d_model)
-        return y
-
-       
-
-
-
 class CausalSelfAttention(nn.Module):
 
     def __init__(self, config):
         super().__init__()
         assert config.n_embd % config.n_head == 0
-        # rotary
-        head_dim = config.n_embd // config.n_head
-        self.rotary = Rotary(dim=head_dim, max_seq_len=config.block_size)
         # key, query, value projections for all heads, but in a batch
-        # uses nn.Linear's initialization
         self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
         # output projection
         self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
         # regularization
         self.attn_dropout = nn.Dropout(config.dropout)
         self.resid_dropout = nn.Dropout(config.dropout)
-        # dimensions
         self.n_head = config.n_head
         self.n_embd = config.n_embd
         self.dropout = config.dropout
@@ -239,21 +58,14 @@ class CausalSelfAttention(nn.Module):
             self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
                                         .view(1, 1, config.block_size, config.block_size))
 
-
-
-    def forward(self, x, start=0):
+    def forward(self, x):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
-        # change: replaced split() with chunk(), with chunking at the end
-        qkv = self.c_attn(x) # (B, T, 3*C)
-        qkv = qkv.view(B, T, 3*self.n_head, C // self.n_head) # (B, T, 3*n_head, head_size)
-        q, k, v = qkv.chunk(3, dim=2) # (B, T, nh, hs)
-
-        # introduce RoPE
-        q, k = self.rotary(q, start), self.rotary(k, start)
-        q,k,v = q.transpose(1,2), k.transpose(1,2), v.transpose(1,2) # (B, nh, T, hs)
-
+        q, k, v  = self.c_attn(x).split(self.n_embd, dim=2)
+        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
 
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
         if self.flash:
@@ -277,30 +89,28 @@ class MLP(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.c_fc    = nn.Linear(config.n_embd, 4 * config.n_embd, bias=config.bias)
-        self.gelu    = nn.GELU()
+        self.relu    = nn.ReLU()
         self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)
-        self.dropout = nn.Dropout(config.dropout)
+        # self.dropout = nn.Dropout(config.dropout)
 
     def forward(self, x):
         x = self.c_fc(x)
-        x = self.gelu(x)
+        x = self.relu(x).square()
         x = self.c_proj(x)
-        x = self.dropout(x)
+        # x = self.dropout(x)
         return x
 
 class Block(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
+        self.ln = lambda x: norm(x)
         self.attn = CausalSelfAttention(config)
-        # self.attn = MultiHeadLatentAttention(config)
-        self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
         self.mlp = MLP(config)
 
     def forward(self, x):
-        x = x + self.attn(self.ln_1(x))
-        x = x + self.mlp(self.ln_2(x))
+        x = x + self.attn(self.ln(x))
+        x = x + self.mlp(self.ln(x))
         return x
 
 @dataclass
@@ -311,10 +121,8 @@ class GPTConfig:
     n_head: int = 12
     n_embd: int = 768
     dropout: float = 0.0
-    d_c: int = 256
-    d_c1: int = 256
-    d_rotate: int = 64
-    bias: bool = False # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
+    bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
+
 
 class GPT(nn.Module):
 
@@ -326,16 +134,17 @@ class GPT(nn.Module):
 
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
+            wpe = nn.Embedding(config.block_size, config.n_embd),
             drop = nn.Dropout(config.dropout),
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
-            ln_f = LayerNorm(config.n_embd, bias=config.bias),
+            # ln_f = LayerNorm(config.n_embd, bias=config.bias),
         ))
-        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
-        # with weight tying when using torch.compile() some warnings get generated:
-        # "UserWarning: functional_call was passed multiple values for tied weights.
-        # This behavior is deprecated and will be an error in future versions"
-        # not 100% sure what this is, so far seems to be harmless. TODO investigate
-        self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
+        # self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        # Untie head from embedding, use FP8 matmul for head, and softcap logits (the latter following Gemma 2)
+        self.lm_head = CastedLinear(config.n_embd, config.vocab_size,
+                                    use_fp8=True, x_s=(config.n_embd**0.5)/448, w_s=24/448, grad_s=1/448)
+        self.lm_head.weight.detach().zero_() # @Grad62304977
+        # self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
 
         # init all weights
         self.apply(self._init_weights) # is a nn.Module function
@@ -355,12 +164,13 @@ class GPT(nn.Module):
         params are actually used as weights in the final layer, so we include them.
         """
         n_params = sum(p.numel() for p in self.parameters())
-        # change: no more wpe
-        # if non_embedding:
-        #     n_params -= self.transformer.wpe.weight.numel()
+        if non_embedding:
+            n_params -= self.transformer.wpe.weight.numel()
         return n_params
 
     def _init_weights(self, module):
+        if isinstance(module, CastedLinear):
+            pass
         if isinstance(module, nn.Linear):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
             if module.bias is not None:
@@ -376,21 +186,25 @@ class GPT(nn.Module):
 
         # forward the GPT model itself
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
-        x = self.transformer.drop(tok_emb)
+        pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
+        x = self.transformer.drop(tok_emb + pos_emb)
+        x = norm(x)
         for block in self.transformer.h:
             x = block(x)
-        x = self.transformer.ln_f(x)
+        x = norm(x)
 
         if targets is not None:
             # if we are given some desired targets also calculate the loss
             logits = self.lm_head(x)
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+            # logits = logits / math.sqrt(x.size(-1))
+            logits = 30 * torch.sigmoid(logits / (7.5 * x.size(-1)**0.5))
+            loss_tensor = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction='none')
         else:
             # inference-time mini-optimization: only forward the lm_head on the very last position
             logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
-            loss = None
+            loss_tensor = None
 
-        return logits, loss
+        return logits, loss_tensor
 
     def crop_block_size(self, block_size):
         # model surgery to decrease the block size if necessary
@@ -398,7 +212,7 @@ class GPT(nn.Module):
         # but want to use a smaller block size for some smaller, simpler model
         assert block_size <= self.config.block_size
         self.config.block_size = block_size
-        # self.transformer.wpe.weight = nn.Parameter(self.transformer.wpe.weight[:block_size])
+        self.transformer.wpe.weight = nn.Parameter(self.transformer.wpe.weight[:block_size])
         for block in self.transformer.h:
             if hasattr(block.attn, 'bias'):
                 block.attn.bias = block.attn.bias[:,:,:block_size,:block_size]

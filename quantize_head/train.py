@@ -8,11 +8,19 @@ from contextlib import nullcontext
 from typing import Dict, Union, List, TypedDict, cast
 
 import numpy as np
-import torch
 from torch.utils.tensorboard import SummaryWriter
 
-from model_new import GPTConfig, GPT
-# from model import GPTConfig, GPT
+# from model_new import GPTConfig, GPT
+from model import GPTConfig, GPT
+
+import math
+import inspect
+from dataclasses import dataclass
+
+import torch
+import torch.nn as nn
+from torch.nn import functional as F
+
 
 # %%
 ##############################
@@ -25,22 +33,22 @@ class Config:
     # I/O
     out_dir: str = 'out-web'
     eval_only: bool = False
-    eval_interval: int = 1000 # when to run eval (saved)
-    eval_iters: int = 200
+    eval_interval: int = 100 # when to run eval (saved)
+    eval_iters: int = 200 # per eval no. of steps
     log_interval: int = 10 # when to print update (not saved)
     log_dir: str = 'tensorboard_log'
     always_save_on_checkpoint: bool = False
-
+    init_from = 'resume'
 
     # logging
     tensorboard_log: bool = True # disable for now
 
     # dataset
     # these make the total batch size be ~0.5M
-    # 12 batch size * 1024 block size * 5 gradaccum * 8 GPUs = 491,520
+    # Original setting: 12 batch size * 1024 block size * 5 gradaccum * 8 GPUs = 491,520
     dataset: str = 'openwebtext'
-    gradient_accumulation_steps: int = 5 * 8
-    batch_size: int = 12 # microbatch size if grad accumulate
+    gradient_accumulation_steps: int = 32 # to increase to 0.5M
+    batch_size: int = 16 # microbatch size if grad accumulate
     block_size: int = 1024
 
     # baby GPT model :)
@@ -51,7 +59,7 @@ class Config:
     bias: bool = False
 
     # adamw optimizer
-    learning_rate: float = 6e-4 # with baby networks can afford to go a bit higher
+    learning_rate: float = 1e-3 # with baby networks can afford to go a bit higher
     max_iters: int = 600000 # 600k * 0.5M = 300B total tokens
     weight_decay: float = 1e-1
     beta1: float = 0.9
@@ -60,9 +68,9 @@ class Config:
 
     # learning rate decay
     decay_lr: bool = True
-    warmup_iters: int = 2000 # not super necessary potentially
+    warmup_iters: int = 10 # not super necessary potentially
     lr_decay_iters: int = max_iters # make equal to max_iters usually
-    min_lr: float = 6e-5 # learning_rate / 10 usually
+    min_lr: float = 1e-5 # learning_rate / 10 usually
 
 
     # system
@@ -165,11 +173,61 @@ model_args['vocab_size'] = meta_vocab_size if meta_vocab_size is not None else 5
 gptconf = GPTConfig(**model_args)
 model = GPT(gptconf)
 
+if config.init_from == 'scratch':
+    # init a new model from scratch
+    print("Initializing a new model from scratch")
+    # determine the vocab size we'll use for from-scratch training
+    if meta_vocab_size is None:
+        print("defaulting to vocab_size of GPT-2 to 50304 (50257 rounded up for efficiency)")
+    model_args['vocab_size'] = meta_vocab_size if meta_vocab_size is not None else 50304
+    gptconf = GPTConfig(**model_args)
+    model = GPT(gptconf)
+elif config.init_from == 'resume':
+    print(f"Resuming training from {config.out_dir}")
+    # resume training from a checkpoint.
+    ckpt_path = os.path.join(config.out_dir, 'ckpt.pt')
+    checkpoint = torch.load(ckpt_path, map_location=config.device, weights_only=False)
+    checkpoint_model_args = checkpoint['model_args']
+    # force these config attributes to be equal otherwise we can't even resume training
+    # the rest of the attributes (e.g. dropout) can stay as desired from command line
+    for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
+        model_args[k] = checkpoint_model_args[k]
+    # create the model
+    gptconf = GPTConfig(**model_args)
+    model = GPT(gptconf)
+        
+    state_dict = checkpoint['model']
+    # fix the keys of the state dictionary :(
+    # honestly no idea how checkpoints sometimes get this prefix, have to debug more
+    unwanted_prefix = '_orig_mod.'
+    for k,v in list(state_dict.items()):
+        if k.startswith(unwanted_prefix):
+            state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
+    model.load_state_dict(state_dict)
+    iter_num = checkpoint['iter_num']
+    best_val_loss = checkpoint['best_val_loss']
+
+elif config.init_from.startswith('gpt2'):
+    print(f"Initializing from OpenAI GPT-2 weights: {config.init_from}")
+    # initialize from OpenAI GPT-2 weights
+    override_args = dict(dropout=config.dropout)
+    model = GPT.from_pretrained(config.init_from, override_args)
+    # read off the created config params, so we can store them into checkpoint correctly
+    for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
+        model_args[k] = getattr(model.config, k)
+#
 # crop down the model block size if desired, using model surgery
 if config.block_size < model.config.block_size:
     model.crop_block_size(config.block_size)
     model_args['block_size'] = config.block_size # so that the checkpoint will have the right value
 model.to(config.device)
+
+# force bfloat16 params for Embeddings
+for m in model.modules():
+    if isinstance(m, nn.Embedding):
+        m.bfloat16()
+
+
 
 # %%
 #########################################
@@ -187,10 +245,11 @@ checkpoint = None # free up memory
 if compile:
     print("compiling the model... (takes a ~minute)")
     unoptimized_model = model
-    model = cast(GPT, torch.compile(model)) # requires PyTorch 2.0
+    model = cast(GPT, torch.compile(model)) # , fullgraph=False)) # requires PyTorch 2.0
 
 
 # helps estimate an arbitrarily accurate loss over either split using many batches
+# there is no need to compensate here as model.eval() will cause self.training to be False
 @torch.no_grad()
 def estimate_loss():
     out = {}
@@ -200,8 +259,8 @@ def estimate_loss():
         for k in range(config.eval_iters):
             X, Y = get_batch(split)
             with ctx:
-                logits, loss = model(X, Y)
-            losses[k] = loss.item()
+                logits, loss_tensor = model(X, Y)
+                losses[k] = loss_tensor.mean().item()
         out[split] = losses.mean()
     model.train()
     return out
@@ -255,6 +314,7 @@ while True:
                     "mfu": running_mfu,
                 },
                 iter_num)
+        # save when val_loss improves
         if losses['val'] < best_val_loss or config.always_save_on_checkpoint:
             best_val_loss = losses['val']
             if iter_num > 0:
@@ -275,8 +335,9 @@ while True:
     # and using the GradScaler if data type is float16
     for micro_step in range(config.gradient_accumulation_steps):
         with ctx:
-            logits, loss = model(X, Y)
-            loss = loss / config.gradient_accumulation_steps # scale the loss to account for gradient accumulation
+            logits, loss_tensor = model(X, Y)
+            # we take the sum of the loss for more pronounced gradient signals
+            loss = loss_tensor.sum() / config.gradient_accumulation_steps # scale the loss to account for gradient accumulation
         # immediately async prefetch next batch while model is doing the forward pass on the GPU
         X, Y = get_batch('train')
         # backward pass, with gradient scaling if training in fp16
@@ -289,6 +350,20 @@ while True:
     # step the optimizer and scaler if training in fp16
     scaler.step(optimizer)
     scaler.update()
+
+    # introduce a gradient analyzer to track over/underflow for fp8 kernel
+    # grad = model.lm_head.weight.grad
+    # if grad is not None:
+    #     abs_max = grad.abs().max().item()
+    #     abs_min = grad.abs().min().item()
+    #     # print(f"[FP8 Grad Check] lm_head weight grad:")
+    #     # print(f"  abs max: {abs_max:.3e}, abs min: {abs_min:.3e}")
+
+    #     if abs_max < 0.002:
+    #         print("  ⚠️ likely underflow")
+    #     elif abs_max > 448:
+    #         print("  ⚠️ likely overflow")
+
     # flush the gradients as soon as we can, no need for this memory anymore
     optimizer.zero_grad(set_to_none=True)
 
@@ -298,8 +373,8 @@ while True:
     t0 = t1
     if iter_num % config.log_interval == 0 and master_process:
         # get loss as float. note: this is a CPU-GPU sync point
-        # scale up to undo the division above, approximating the true total loss (exact would have been a sum)
-        lossf = loss.item() * config.gradient_accumulation_steps
+        # loss is a sum of all token losses, but already factored in the number of mini-batches
+        lossf = loss_tensor.mean().item()
         if local_iter_num >= 5: # let the training loop settle a bit
             mfu = raw_model.estimate_mfu(config.batch_size * config.gradient_accumulation_steps, dt)
             running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
@@ -310,4 +385,3 @@ while True:
     # termination conditions
     if iter_num > config.max_iters:
         break
-
