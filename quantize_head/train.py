@@ -59,7 +59,7 @@ class Config:
     bias: bool = False
 
     # adamw optimizer
-    learning_rate: float = 1e-3 # with baby networks can afford to go a bit higher
+    learning_rate: float = 6e-4 # with baby networks can afford to go a bit higher
     max_iters: int = 600000 # 600k * 0.5M = 300B total tokens
     weight_decay: float = 1e-1
     beta1: float = 0.9
@@ -70,7 +70,7 @@ class Config:
     decay_lr: bool = True
     warmup_iters: int = 10 # not super necessary potentially
     lr_decay_iters: int = max_iters # make equal to max_iters usually
-    min_lr: float = 1e-5 # learning_rate / 10 usually
+    min_lr: float = 6e-5 # learning_rate / 10 usually
 
 
     # system
@@ -242,7 +242,7 @@ optimizer = model.configure_optimizers(
 checkpoint = None # free up memory
 
 # compile the model
-if compile:
+if config.compile:
     print("compiling the model... (takes a ~minute)")
     unoptimized_model = model
     model = cast(GPT, torch.compile(model)) # , fullgraph=False)) # requires PyTorch 2.0
